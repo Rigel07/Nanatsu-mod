@@ -1,0 +1,139 @@
+name: Build mods from ZIP
+
+# Sube un .zip con el proyecto del mod (sin descomprimir) a la raiz del repositorio.
+# El workflow lo descomprime, compila cada mod con Gradle y deja los .jar en:
+#   Actions -> ultimo run -> Artifacts -> mod-jars
+# Si no hay ningun .zip, compila el proyecto que haya (build.gradle) en el repositorio.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Opcional: compilar solo los zips cuyo nombre contenga este texto'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.1.1
+
+      - name: Descomprimir y compilar
+        env:
+          ONLY: ${{ github.event.inputs.only }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p work dist
+          failed=()
+          built=0
+
+          build_project() {
+            local dir="$1" slug="$2"
+            echo "::group::Compilando $slug"
+            local rc=0
+            (
+              cd "$dir" || exit 1
+              if [ -f gradlew ]; then
+                chmod +x gradlew
+                ./gradlew build --no-daemon
+              else
+                gradle build --no-daemon
+              fi
+            ) || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$slug no compila (revisa el log de arriba)."
+              failed+=("$slug")
+              return
+            fi
+            mkdir -p "dist/$slug"
+            find "$dir/build/libs" -maxdepth 1 -name '*.jar' \
+              ! -name '*-sources.jar' ! -name '*-javadoc.jar' \
+              -exec cp -v {} "dist/$slug/" \;
+            local jar classes any=0
+            for jar in "dist/$slug"/*.jar; do
+              [ -e "$jar" ] || continue
+              any=1
+              classes="$(unzip -l "$jar" | grep -c '\.class' || true)"
+              echo "$jar -> $classes clases"
+              if [ "$classes" -eq 0 ]; then
+                echo "::error::$jar no contiene clases."
+                failed+=("$slug")
+              fi
+            done
+            if [ "$any" -eq 0 ]; then
+              echo "::error::$slug no genero ningun .jar."
+              failed+=("$slug")
+            else
+              built=$((built + 1))
+            fi
+          }
+
+          # 1) Cada .zip del repo se descomprime y se compila
+          zips=0
+          while IFS= read -r -d '' zip; do
+            name="$(basename "$zip" .zip)"
+            if [ -n "${ONLY:-}" ] && [[ "$name" != *"$ONLY"* ]]; then
+              echo "Saltando $zip (no coincide con '$ONLY')"
+              continue
+            fi
+            zips=$((zips + 1))
+            slug="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+            echo "Encontrado zip: $zip"
+            rm -rf "work/$slug"; mkdir -p "work/$slug"
+            unzip -q -o "$zip" -d "work/$slug"
+            # build.gradle puede estar en la raiz del zip o dentro de una carpeta
+            gradle_file="$(find "work/$slug" -name build.gradle \
+              -not -path '*/build/*' -not -path '*/__MACOSX/*' -print -quit)"
+            if [ -z "$gradle_file" ]; then
+              echo "::warning::$zip no contiene build.gradle, se ignora."
+              continue
+            fi
+            build_project "$(dirname "$gradle_file")" "$slug"
+          done < <(find . -maxdepth 3 -type f -iname '*.zip' \
+                     -not -path './.git/*' -not -path './work/*' -not -path './dist/*' -print0)
+
+          # 2) Si no hay zips, compila el proyecto tal cual esta en el repo
+          if [ "$zips" -eq 0 ]; then
+            gradle_file="$(find . -name build.gradle -not -path './work/*' \
+              -not -path '*/build/*' -not -path './.git/*' -print -quit)"
+            if [ -z "$gradle_file" ]; then
+              echo "::error::No hay ningun .zip ni build.gradle en el repositorio."
+              exit 1
+            fi
+            build_project "$(dirname "$gradle_file")" "proyecto"
+          fi
+
+          echo
+          echo "Mods compilados: $built"
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::Fallaron: ${failed[*]}"
+            exit 1
+          fi
+          if [ "$built" -eq 0 ]; then
+            echo "::error::No se compilo ningun mod."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mod-jars
+          path: dist
+          if-no-files-found: warn
